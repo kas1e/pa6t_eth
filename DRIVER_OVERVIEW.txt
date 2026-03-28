@@ -1,0 +1,187 @@
+PA6T Ethernet Driver -- Overview
+=================================
+
+This is an AmigaOS 4 SANA-II network device driver for the PA6T-1682M's
+on-chip GMAC (1G Ethernet) in the AmigaOne X1000.
+
+The driver communicates with 3 on-chip PCI devices: GMAC (MAC registers),
+DMA (TX/RX descriptor rings, RX buffer ring, and channel control), and IOB (interrupt
+status/acknowledge).  IOB is accessed via direct MMIO for interrupt safety;
+GMAC and DMA use ReadConfigLong/WriteConfigLong.
+
+TX and RX channel numbers are hardcoded to 1 but can be set to any free
+channel.  Before use, the driver checks the status register to verify the
+chosen channel is not already active (e.g. channel 0 is used by
+pasemi_dma.resource).
+
+RX uses interrupt-driven processing: hardware fires an interrupt when packets
+arrive, the IRQ handler wakes the unit task, and the unit task delivers
+packets to RoadShow.  TX is fire-and-forget: the packet is submitted to the
+DMA engine and we return immediately with no TX interrupt.
+
+The RX path includes a workaround for PA6T hardware bug Errata 5971 (found
+in the Linux pasemi_mac driver -- see Linux source for reference) which
+resets PKTHDRCNT after every RX batch to prevent stale counters from
+misdirecting DMA.
+
+The driver follows the SANA-II protocol -- RoadShow (or any TCP/IP stack)
+provides a copy hook that the driver uses to transfer packet data between
+DMA buffers and the stack's buffers.
+
+
+--- Lifecycle ---
+
+As with every device, the first function to execute is the one pointed to by
+the CLT_InitFunc tag in dev_init_tags. The name does not matter as it is a
+pointer; for us it is Init.c's _manager_Init().
+
+_manager_Init() performs basic initialisation and configuration of the device(s).
+It is called when OS4 finds a "*.device" (marked RTF_COLDSTART) to load, or when
+OpenDevice() is called (e.g. from RoadShow prefs), which first calls _manager_Init()
+and then everything else.
+
+
+--- manager_Init (Init.c) ---
+
+1. Open expansion.library (for PCI-based functions) and utility.library
+   (for CallHookPkt to perform data copies between us and Roadshow).
+
+2. Find pointers to the 3 PCI devices we use -- MAC, DMA and IOB -- via
+   IPCI->FindDeviceTags(). (hw/pci.c)
+
+3. Allocate the unit struct (PA6TEthUnit) and initialise its lists and
+   semaphore. The lists (read_list_ipv4, read_list_arp, read_list_other)
+   queue pending read requests from RoadShow, sorted by packet type (this
+   is how SANA-II on AmigaOS works). event_list is for status notifications
+   (link up/down); opener_list tracks who has the device open.
+
+4. Perform actual hardware initialisation via PA6TEth_HWInit(), which sets
+   up our PCI devices (hw/hw_init.c):
+
+   - find_dma_interface_of_mac: finds which DMA interface is assigned to our
+     MAC. The SoC's DMA engine has multiple interface slots -- we look up
+     which one is assigned to our MAC. While we know this is most often
+     interface #5, looking it up is safer, in case a board revision changes
+     the assignment.
+
+   - read_mac_addr(base): reads the MAC address (or sets a fallback if it
+     fails).  Without a MAC address nothing works - not the hardware, not
+     RoadShow, nothing.
+
+   - Assign channel numbers, currently: TX channel = 1, RX channel = 1
+    (TX channel 0 is used by pasemi_dma.resource, so we skip it). Checked
+	TCMDSTA for TX, CCMDSTA for RX if they active or not becuase assing.
+	
+
+   - Allocate TX descriptor ring, RX descriptor ring, and RX buffer ring,
+     all via AllocVecTags() + get_phys() (StartDma() / GetDMAList() /
+     EndDma()).
+
+   - Mark all 3 rings as cache-inhibited (as on Linux).
+
+   - Configure TX channel.
+   - Configure RX channel.
+   - Configure MAC.
+
+5. Back in manager_Init() -- MAC and DMA channels are fully configured but
+   idle, not yet enabled. Install the IRQ handler (PA6TEth_InstallIRQ()) so
+   that when packets arrive, the IOB fires an interrupt on our DMA channel's
+   vector. (hw/irq.c)
+
+6. Perform standard AmigaOS device registration: fill in name, version,
+   revision, etc. At this point we are done. The device is registered,
+   DMA/MAC are ready and configured, everything is idle and waiting.
+
+   The driver now waits for someone to call OpenDevice(), which invokes
+   _manager_Open().
+
+
+--- manager_Open (Open.c) ---
+
+1. Verify that the unit number is 0, and nothing else (safety check).
+
+2. Prepare RoadShow's hook pointer (opener{} struct) for copying data between
+   DMA and RoadShow -- either using RoadShow's internal copy or our own
+   inline-assembly fast-copy function. Currently only prepared, not yet used;
+   it is filled in later when RoadShow sends S2_SANA2HOOK through BeginIO.
+   The actual copying happens even later, during RX/TX.
+
+3. UnitTask_Start(): the heart of the driver. We create it via
+   IExec->CreateTaskTags().
+
+   The unit task sits in a loop waiting for 3 things:
+
+   a) IO commands from RoadShow (via message port) --
+      S2_ONLINE, S2_OFFLINE, S2_CONFIGINTERFACE, etc.
+   b) IRQ signal from the interrupt handler -- means packets have arrived;
+      calls ProcessRX() to deliver them.
+   c) CTRL_C -- shutdown signal.
+
+   It is essentially a dispatcher: it does not perform hardware work itself;
+   it reacts to events and calls the appropriate functions
+   (PostRxBuffers, ProcessRX, FlushReadQueue).
+
+4. Add the opener to the unit's opener_list (under semaphore lock).
+
+5. Increment open_count, fill in the IORequest, return success.
+
+   Control returns to RoadShow, which then proceeds:
+
+
+--- BeginIO (BeginIO.c) ---
+
+1. S2_SANA2HOOK -- RoadShow sends its copy hook; we store it in
+   opener->s2hook. The opener is now fully armed (cookie + hook).
+
+2. S2_CONFIGINTERFACE (or S2_ONLINE) -- this goes to the unit task's
+   message port. The unit task handles it: sets unit->online = TRUE,
+   calls PostRxBuffers() to arm the RX ring with buffers, and enables
+   the MAC. The hardware is now live.
+
+
+--- Driver is now running ---
+
+
+RX path (hw/rx.c, hw/irq.c):
+
+   1. A packet arrives from the network and the GMAC passes it to the DMA
+      engine via the assigned DMA interface.
+   2. The DMA engine writes the packet data into the next available RX buffer
+      (previously posted by PostRxBuffers) and writes a completion descriptor
+      into the RX descriptor ring.
+   3. When the packet count threshold (CNTTH) is reached, the IOB fires an
+      interrupt on our DMA channel's vector.
+   4. The IRQ handler (hw/irq.c) reads IOB's RXCH_STAT to confirm it is ours,
+      acknowledges the interrupt (resets PCNT, PINTC, and conditionally TINTC,
+      SINTC, DINTC), then signals the unit task.
+   5. The unit task wakes up and calls ProcessRX().
+   6. ProcessRX() walks the RX descriptor ring, for each completed packet:
+      - extracts EtherType, source/destination MAC addresses
+      - finds a matching pending read request from the appropriate list
+        (read_list_ipv4, read_list_arp, or read_list_other)
+      - calls the opener's copy hook to copy the packet data into RoadShow's
+        buffer
+      - replies the IORequest back to RoadShow
+      - replenishes the consumed RX buffer with a fresh one
+   7. After the batch, applies Errata 5971 workaround (resets PKTHDRCNT).
+
+TX path (hw/tx.c) -- fire-and-forget, no TX interrupt:
+
+   1. RoadShow sends CMD_WRITE (or S2_BROADCAST/S2_MULTICAST) through
+      BeginIO(). This is handled directly in the caller's context, not
+      through the unit task.
+   2. TransmitPacket() allocates a TX buffer and builds the Ethernet header
+      (destination MAC, source MAC, EtherType).
+   3. Calls the opener's copy hook to copy the payload from RoadShow's
+      buffer into our TX buffer.
+   4. Maps the TX buffer to a physical address via get_phys().
+   5. Builds a TX descriptor (XCT_MACTX) with the buffer address and length,
+      writes it into the TX descriptor ring.
+   6. Kicks the DMA engine by updating the TX ring write pointer.
+   7. Returns immediately -- no interrupt, no completion wait. The DMA engine
+      sends the packet in the background.
+
+
+--- Shutdown ---
+
+   _manager_Close() / _manager_Expunge()
